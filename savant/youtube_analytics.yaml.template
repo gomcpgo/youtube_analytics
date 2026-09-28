@@ -1,0 +1,20 @@
+name: YouTube Analytics
+command: "{{INSTALL_PATH}}/mcp_servers/youtube_analytics{{EXECUTABLE_EXT}}"
+shortDescription: Analyze your own YouTube channels
+description: >-
+  Analytics for YouTube channels you own via Google's official APIs: channel health vs the
+  previous period, per-video performance, audience retention and drop-off points, thumbnail
+  impressions and click-through rate, traffic sources and search terms, audience demographics,
+  trends and comments. Uses your own Google Cloud OAuth client (Desktop app).
+type: built-in
+secret_keys:
+  - YOUTUBE_OAUTH_CLIENT_ID
+  - YOUTUBE_OAUTH_CLIENT_SECRET
+instructions: >-
+  Start with list_channels; if nothing is connected, call connect_channel, which opens Google
+  sign-in in the browser. YouTube Analytics data lags 2-3 days, so rolling periods end 3 days ago;
+  say so when the user asks about very recent uploads. Impressions and CTR come from daily reach
+  reports that start about 48 hours after a channel is connected and include the prior 30 days;
+  relay the coverage note instead of guessing. For "why did this video underperform", use
+  video_report first, then video_retention for exact drop-off timestamps. Always name the period
+  you are describing.
