@@ -29,7 +29,7 @@ var tools = []protocol.Tool{
 			"Run once per channel: for a Google account with several channels (brand accounts), pick the channel on the consent screen, then connect again for the next one. " +
 			"Also schedules YouTube's daily reach reports for the channel, the only API source of impressions and click-through rate (first data about 48 hours later, with 30 days of history).",
 		InputSchema: schema(`{"type": "object", "properties": {
-			"wait_seconds": {"type": "integer", "minimum": 0, "maximum": 300, "default": 120, "description": "How long to wait for the user to finish in the browser"},
+			"wait_seconds": {"type": "integer", "minimum": 0, "maximum": 300, "default": 90, "description": "How long to wait for the user to finish in the browser"},
 			"open_browser": {"type": "boolean", "default": true, "description": "Open the consent page in the default browser"}}}`),
 		Annotations: &protocol.ToolAnnotations{ReadOnlyHint: boolPtr(false), DestructiveHint: boolPtr(false), IdempotentHint: boolPtr(false), OpenWorldHint: boolPtr(true)},
 	},
@@ -97,7 +97,7 @@ var tools = []protocol.Tool{
 			` + videoParam + `,
 			"audience_type": {"type": "string", "enum": ["all", "organic", "ad_instream", "ad_indisplay"], "default": "all"},
 			"subscribed_status": {"type": "string", "enum": ["all", "subscribed", "unsubscribed"], "default": "all"},
-			"points": {"type": "integer", "enum": [10, 20, 50, 100], "default": 20, "description": "Curve points shown in the text (the full 100-point curve is always in structured content)"}},
+			"points": {"type": "integer", "enum": [10, 20, 50, 100], "default": 20, "description": "Curve points to list; 100 gives the full curve"}},
 			"required": ["video_id"]}`),
 		Annotations: readOnly,
 	},
@@ -153,7 +153,7 @@ var tools = []protocol.Tool{
 	},
 	{
 		Name:        "video_comments",
-		Description: "Recent or top comments on one video or across the whole channel, with likes and reply counts. Set unanswered_only to find comments the channel has not replied to. Use it for audience questions, content ideas and sentiment.",
+		Description: "Recent or top comments on one video or across the whole channel, with likes and reply counts. Set unanswered_only to find comments the channel has not replied to. Use it for audience questions, content ideas and sentiment. Needs YOUTUBE_API_KEY (public comments only).",
 		InputSchema: schema(`{"type": "object", "properties": {
 			` + channelParam + `,
 			` + videoParam + `,

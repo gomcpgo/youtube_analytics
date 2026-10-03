@@ -3,6 +3,7 @@ package analytics
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/gomcpgo/youtube_analytics/pkg/reach"
@@ -43,6 +44,7 @@ type Overview struct {
 	Revenue   []Delta           `json:"revenue,omitempty"`
 	TopVideos []VideoStat       `json:"top_videos,omitempty"`
 	Reach     Coverage          `json:"reach"`
+	Notes     []string          `json:"notes,omitempty"`
 	Errors    map[string]string `json:"errors,omitempty"`
 }
 
@@ -75,6 +77,9 @@ func (s *Service) Overview(ctx context.Context, spec PeriodSpec, opt OverviewOpt
 		prev = nil
 	}
 	o := &Overview{Channel: ch, Period: cur, Previous: prev}
+	if created := ch.PublishedAt.In(youtube.Pacific).Format(dateLayout); prev != nil && prev.Start < created {
+		o.Notes = append(o.Notes, fmt.Sprintf("The channel was created on %s, inside the comparison period (%s to %s), so percentage changes are inflated.", created, prev.Start, prev.End))
+	}
 
 	var e errs
 	var basicCur, basicPrev, fmtCur, fmtPrev, revCur, revPrev *youtube.Table
@@ -233,7 +238,7 @@ func (s *Service) Overview(ctx context.Context, spec PeriodSpec, opt OverviewOpt
 		for _, r := range fmtCur.Rows {
 			typ := fmtCur.Str(r, "creatorContentType")
 			f := FormatStat{
-				Type: typ, Format: Label("creatorContentType", typ),
+				Type: Canonical(typ), Format: Label("creatorContentType", typ),
 				Views: fmtCur.Num(r, "views"), EngagedViews: fmtCur.Num(r, "engagedViews"),
 				WatchMinutes: fmtCur.Num(r, "estimatedMinutesWatched"), AvgViewDurationSec: fmtCur.Num(r, "averageViewDuration"),
 				AvgViewPct: fmtCur.Num(r, "averageViewPercentage"),

@@ -116,3 +116,37 @@ func TestFilesArePrivate(t *testing.T) {
 		t.Errorf("index.json mode = %v, %v", fi.Mode(), err)
 	}
 }
+
+// stubAPI returns fixed jobs and a fixed error from Reports.
+type stubAPI struct {
+	jobs    []youtube.Job
+	reports error
+}
+
+func (s *stubAPI) Jobs(context.Context) ([]youtube.Job, error) { return s.jobs, nil }
+func (s *stubAPI) CreateJob(_ context.Context, rt, _ string) (*youtube.Job, error) {
+	return &youtube.Job{ID: "new-" + rt, ReportTypeID: rt, CreateTime: time.Now()}, nil
+}
+func (s *stubAPI) Reports(context.Context, string) ([]youtube.Report, error) { return nil, s.reports }
+func (s *stubAPI) Download(context.Context, string) ([]byte, error)          { return nil, nil }
+
+func TestSyncToleratesUnavailableNewJobs(t *testing.T) {
+	unavailable := &youtube.APIError{Status: 503, Message: "The service is currently unavailable."}
+	young := []youtube.Job{{ID: "a", ReportTypeID: Basic, CreateTime: time.Now()}, {ID: "b", ReportTypeID: Combined, CreateTime: time.Now()}}
+	c, _ := Open(t.TempDir())
+	if _, err := c.Sync(context.Background(), &stubAPI{jobs: young, reports: unavailable}, 0); err != nil {
+		t.Errorf("a 503 from a job created minutes ago means no reports yet, not an error: %v", err)
+	}
+	if c.Status().LastSync.IsZero() {
+		t.Error("a clean sync should record LastSync")
+	}
+
+	old := []youtube.Job{{ID: "a", ReportTypeID: Basic, CreateTime: time.Now().AddDate(0, 0, -10)}, {ID: "b", ReportTypeID: Combined, CreateTime: time.Now().AddDate(0, 0, -10)}}
+	c2, _ := Open(t.TempDir())
+	if _, err := c2.Sync(context.Background(), &stubAPI{jobs: old, reports: unavailable}, 0); err == nil {
+		t.Error("a 503 from an old job should be reported")
+	}
+	if !c2.Status().LastSync.IsZero() {
+		t.Error("a failed sync must not record LastSync, so the next call retries")
+	}
+}

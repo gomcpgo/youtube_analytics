@@ -3,6 +3,7 @@ package analytics
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -40,8 +41,14 @@ type Retention struct {
 	VideoID     string            `json:"video_id"`
 	Title       string            `json:"title"`
 	DurationSec float64           `json:"duration_seconds"`
+	Views       int64             `json:"lifetime_views"`
 	Filters     map[string]string `json:"filters,omitempty"`
 	Period      Period            `json:"period"`
+	// Smoothed means the analysis ran on a 5-point moving average because
+	// the video has few views and the raw curve is noisy.
+	Smoothed bool `json:"smoothed"`
+	// ExitData is false when YouTube withheld startedWatching/stoppedWatching.
+	ExitData bool `json:"exit_data"`
 
 	AvgWatchPct float64  `json:"approx_avg_percentage_viewed"`
 	StartPct    float64  `json:"retention_at_start_pct"`
@@ -61,6 +68,10 @@ type Retention struct {
 	StrongSpans []Span           `json:"above_typical_spans"` // relative performance > 0.65
 	Points      []RetentionPoint `json:"points"`
 }
+
+// smoothBelowViews is the lifetime view count under which the curve is
+// smoothed before looking for drops and spikes.
+const smoothBelowViews = 1000
 
 // RetentionOptions filter the curve.
 type RetentionOptions struct {
@@ -84,41 +95,72 @@ func (s *Service) Retention(ctx context.Context, videoID string, opt RetentionOp
 		}
 	}
 	sort.Strings(filters[1:])
-	t, err := s.query(ctx, youtube.Query{
-		Start: p.Start, End: p.End, Dimensions: []string{"elapsedVideoTimeRatio"}, Filters: filters,
-		Metrics: []string{"audienceWatchRatio", "relativeRetentionPerformance", "startedWatching", "stoppedWatching"},
-	}, "startedWatching", "stoppedWatching")
-	if err != nil {
-		return nil, err
+	// Exit counts are thresholded separately: asking for them together with
+	// the curve makes YouTube return no rows at all for smaller videos.
+	q := func(metrics ...string) youtube.Query {
+		return youtube.Query{Start: p.Start, End: p.End, Dimensions: []string{"elapsedVideoTimeRatio"}, Filters: filters, Metrics: metrics}
 	}
-	if len(t.Rows) == 0 {
+	var curve, exits *youtube.Table
+	var curveErr error
+	parallel(
+		func() {
+			curve, curveErr = s.query(ctx, q("audienceWatchRatio", "relativeRetentionPerformance"), "relativeRetentionPerformance")
+		},
+		func() { exits, _ = s.yt.Query(ctx, q("startedWatching", "stoppedWatching")) },
+	)
+	if curveErr != nil {
+		return nil, curveErr
+	}
+	if len(curve.Rows) == 0 {
 		return nil, errors.New("YouTube returned no retention data for this video: it needs a minimum number of views (and the filters must match some views)")
 	}
-	pts := make([]RetentionPoint, 0, len(t.Rows))
-	for _, r := range t.Rows {
-		pts = append(pts, RetentionPoint{
-			Ratio: t.Num(r, "elapsedVideoTimeRatio"), Watch: t.Num(r, "audienceWatchRatio"),
-			Relative: t.Num(r, "relativeRetentionPerformance"), Started: t.Num(r, "startedWatching"), Stopped: t.Num(r, "stoppedWatching"),
-		})
+	type exit struct{ started, stopped float64 }
+	byRatio := map[string]exit{}
+	if exits != nil {
+		for _, r := range exits.Rows {
+			byRatio[fmt.Sprintf("%.2f", exits.Num(r, "elapsedVideoTimeRatio"))] = exit{exits.Num(r, "startedWatching"), exits.Num(r, "stoppedWatching")}
+		}
 	}
-	res := AnalyzeRetention(pts, v.Duration.Seconds())
-	res.VideoID, res.Title, res.Period = v.ID, v.Title, p
+	pts := make([]RetentionPoint, 0, len(curve.Rows))
+	for _, r := range curve.Rows {
+		ratio := curve.Num(r, "elapsedVideoTimeRatio")
+		ex := byRatio[fmt.Sprintf("%.2f", ratio)]
+		pts = append(pts, RetentionPoint{Ratio: ratio, Watch: curve.Num(r, "audienceWatchRatio"),
+			Relative: curve.Num(r, "relativeRetentionPerformance"), Started: ex.started, Stopped: ex.stopped})
+	}
+	res := AnalyzeRetention(pts, v.Duration.Seconds(), v.Views < smoothBelowViews)
+	res.VideoID, res.Title, res.Period, res.Views, res.ExitData = v.ID, v.Title, p, v.Views, len(byRatio) > 0
 	if len(applied) > 0 {
 		res.Filters = applied
 	}
 	return res, nil
 }
 
-// AnalyzeRetention derives the hook, drop-offs, rewatches and exits from a curve.
-func AnalyzeRetention(pts []RetentionPoint, durationSec float64) *Retention {
+// AnalyzeRetention derives the hook, drop-offs, rewatches and exits from a
+// curve. With smooth set, it works on a 5-point moving average so that the
+// noise of a low-view curve is not reported as drops and rewatch spikes.
+func AnalyzeRetention(pts []RetentionPoint, durationSec float64, smooth bool) *Retention {
 	sort.Slice(pts, func(i, j int) bool { return pts[i].Ratio < pts[j].Ratio })
 	for i := range pts {
 		pts[i].Second = pts[i].Ratio * durationSec
 	}
-	r := &Retention{DurationSec: durationSec, Points: pts}
+	r := &Retention{DurationSec: durationSec, Points: pts, Smoothed: smooth}
 	n := len(pts)
 	if n == 0 {
 		return r
+	}
+	watch := make([]float64, n)
+	for i := range pts {
+		if !smooth {
+			watch[i] = pts[i].Watch * 100
+			continue
+		}
+		var sum float64
+		lo, hi := max(0, i-2), min(n-1, i+2)
+		for j := lo; j <= hi; j++ {
+			sum += pts[j].Watch
+		}
+		watch[i] = sum / float64(hi-lo+1) * 100
 	}
 	at := func(ratio float64) int {
 		best := 0
@@ -129,7 +171,7 @@ func AnalyzeRetention(pts []RetentionPoint, durationSec float64) *Retention {
 		}
 		return best
 	}
-	w := func(i int) float64 { return pts[i].Watch * 100 }
+	w := func(i int) float64 { return watch[i] }
 	span := func(from, to int) Span {
 		start := 0.0
 		if from > 0 {
@@ -165,8 +207,14 @@ func AnalyzeRetention(pts []RetentionPoint, durationSec float64) *Retention {
 	for i := introEnd + 1; i <= outroStart; i++ {
 		segs = append(segs, segment{i, w(i) - w(i-1)})
 	}
-	r.Drops = pickSpans(segs, func(d float64) bool { return d < 0 }, -1.0, 5, span)
-	r.Rewatches = pickSpans(segs, func(d float64) bool { return d > 0 }, 0.5, 3, span)
+	// On smoothed low-view curves one viewer is worth several points, so
+	// smaller moves are noise.
+	floor := 1.0
+	if smooth {
+		floor = 2.0
+	}
+	r.Drops = pickSpans(segs, func(d float64) bool { return d < 0 }, -floor, 5, span)
+	r.Rewatches = pickSpans(segs, func(d float64) bool { return d > 0 }, floor, 3, span)
 
 	var stopped float64
 	for i := 0; i < outroStart; i++ {
@@ -192,6 +240,10 @@ func AnalyzeRetention(pts []RetentionPoint, durationSec float64) *Retention {
 	return r
 }
 
+// minSegmentPP ignores gentle slopes between neighbouring points, so a drop
+// span is not padded with the ordinary decline around a cliff.
+const minSegmentPP = 0.5
+
 // segment is the change d (points) from point i-1 to point i.
 type segment struct {
 	i int
@@ -199,16 +251,17 @@ type segment struct {
 }
 
 // pickSpans picks the largest segments matching want, merges adjacent picks
-// into spans, keeps those whose total change beats minPP (in points) and
-// ranks them by their steepest segment, so sharp cliffs outrank slow slides.
+// into spans, keeps those whose total change beats minPP (in points), keeps
+// the `keep` spans with the steepest segment (sharp cliffs outrank slow
+// slides) and returns them in time order.
 func pickSpans(segs []segment, want func(float64) bool, minPP float64, keep int, span func(int, int) Span) []Span {
 	var cand []segment
 	for _, x := range segs {
-		if want(x.d) {
+		if want(x.d) && math.Abs(x.d) >= minSegmentPP {
 			cand = append(cand, x)
 		}
 	}
-	sort.Slice(cand, func(i, j int) bool { return math.Abs(cand[i].d) > math.Abs(cand[j].d) })
+	sort.SliceStable(cand, func(i, j int) bool { return math.Abs(cand[i].d) > math.Abs(cand[j].d) })
 	cand = cand[:min(len(cand), keep*2)]
 	sort.Slice(cand, func(i, j int) bool { return cand[i].i < cand[j].i })
 
@@ -234,6 +287,8 @@ func pickSpans(segs []segment, want func(float64) bool, minPP float64, keep int,
 	for _, r := range out[:min(len(out), keep)] {
 		spans = append(spans, r.Span)
 	}
+	// Report in time order so they can be matched against the script.
+	sort.Slice(spans, func(i, j int) bool { return spans[i].FromSec < spans[j].FromSec })
 	return spans
 }
 

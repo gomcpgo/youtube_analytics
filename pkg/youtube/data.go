@@ -2,8 +2,10 @@ package youtube
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -241,9 +243,21 @@ type Comment struct {
 	PublishedAt  time.Time `json:"published_at"`
 }
 
+// ErrNoAPIKey explains how to enable comments.
+var ErrNoAPIKey = errors.New("reading comments needs a YouTube Data API key: the channel sign-in only grants read-only " +
+	"analytics access, and YouTube requires a broader read-write scope for comments over OAuth. In Google Cloud Console " +
+	"open APIs & Services > Credentials > Create credentials > API key, restrict it to YouTube Data API v3, set YOUTUBE_API_KEY " +
+	"in the MCP server's environment and restart the server")
+
 // Comments lists top-level comments on a video, or across the whole channel
-// when videoID is empty. order is "time" or "relevance".
-func (c *Client) Comments(ctx context.Context, channelID, videoID, order string, limit int) ([]Comment, error) {
+// when videoID is empty. order is "time" or "relevance". It uses an API key
+// rather than OAuth: commentThreads.list over OAuth requires the read-write
+// youtube.force-ssl scope. With a key it sees public comments only.
+func (c *Client) Comments(ctx context.Context, apiKey, channelID, videoID, order string, limit int) ([]Comment, error) {
+	if apiKey == "" {
+		return nil, ErrNoAPIKey
+	}
+	plain := &http.Client{Timeout: c.http.Timeout}
 	var out []Comment
 	page := ""
 	for len(out) < limit {
@@ -256,6 +270,7 @@ func (c *Client) Comments(ctx context.Context, channelID, videoID, order string,
 		if page != "" {
 			v.Set("pageToken", page)
 		}
+		v.Set("key", apiKey)
 		var resp struct {
 			NextPageToken string `json:"nextPageToken"`
 			Items         []struct {
@@ -274,7 +289,11 @@ func (c *Client) Comments(ctx context.Context, channelID, videoID, order string,
 				} `json:"replies"`
 			} `json:"items"`
 		}
-		if err := c.getJSON(ctx, withQuery(c.DataURL+"/commentThreads", v), &resp); err != nil {
+		b, err := c.doWith(ctx, plain, http.MethodGet, withQuery(c.DataURL+"/commentThreads", v), nil)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(b, &resp); err != nil {
 			return nil, err
 		}
 		for _, it := range resp.Items {

@@ -5,6 +5,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -96,7 +97,11 @@ func (h *Handler) CallTool(ctx context.Context, req *protocol.CallToolRequest) (
 		return errorResponse(fmt.Sprintf("unknown tool: %s", req.Name)), nil
 	}
 	if err != nil {
-		return errorResponse(err.Error()), nil
+		msg := err.Error()
+		if errors.Is(err, auth.ErrNoClient) && h.cfg.SetupHint() != "" {
+			msg += ". " + h.cfg.SetupHint()
+		}
+		return errorResponse(msg), nil
 	}
 	return resp, nil
 }
@@ -229,26 +234,11 @@ func (a args) videoID(required bool) (string, error) {
 
 // --- response helpers ---------------------------------------------------
 
-func textResponse(text string, structured interface{}) *protocol.CallToolResponse {
-	resp := &protocol.CallToolResponse{Content: []protocol.ToolContent{{Type: "text", Text: text}}}
-	if structured != nil {
-		if m := toMap(structured); m != nil {
-			resp.StructuredContent = m
-		}
-	}
-	return resp
-}
-
-func toMap(v interface{}) map[string]interface{} {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil
-	}
-	var m map[string]interface{}
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil
-	}
-	return m
+// textResponse returns markdown only. Structured content is deliberately
+// not sent: clients such as Claude Code show it to the model instead of the
+// text, which would drop the notes and guidance written into the text.
+func textResponse(text string) *protocol.CallToolResponse {
+	return &protocol.CallToolResponse{Content: []protocol.ToolContent{{Type: "text", Text: text}}}
 }
 
 func errorResponse(msg string) *protocol.CallToolResponse {

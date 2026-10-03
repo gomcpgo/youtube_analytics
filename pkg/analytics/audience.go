@@ -3,6 +3,7 @@ package analytics
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -22,6 +23,7 @@ type Breakdown struct {
 	Title   string         `json:"title"`
 	Columns []string       `json:"columns"`
 	Rows    []BreakdownRow `json:"rows"`
+	Note    string         `json:"note,omitempty"`
 	Error   string         `json:"error,omitempty"`
 }
 
@@ -73,7 +75,12 @@ func (s *Service) Audience(ctx context.Context, spec PeriodSpec, videoID string,
 		}
 	}
 	out := &Audience{Period: cur, VideoID: videoID, Breakdowns: make([]Breakdown, len(which))}
-	var fns []func()
+	var total float64
+	fns := []func(){func() {
+		if t, err := s.yt.Query(ctx, youtube.Query{Start: cur.Start, End: cur.End, Metrics: []string{"views"}, Filters: filterVideo(videoID)}); err == nil && len(t.Rows) > 0 {
+			total = t.Num(t.Rows[0], "views")
+		}
+	}}
 	for i, name := range which {
 		i, name := i, name
 		fns = append(fns, func() {
@@ -85,7 +92,33 @@ func (s *Service) Audience(ctx context.Context, spec PeriodSpec, videoID string,
 		})
 	}
 	parallel(fns...)
+	for i := range out.Breakdowns {
+		shareOfTotal(&out.Breakdowns[i], total)
+	}
 	return out, nil
+}
+
+// shareOfTotal rebases view shares on the period's total views. YouTube
+// omits groups below its privacy threshold (countries especially), so the
+// listed rows can cover far less than 100% of views.
+func shareOfTotal(b *Breakdown, total float64) {
+	if len(b.Rows) == 0 || total <= 0 {
+		return
+	}
+	if _, ok := b.Rows[0].Values["view_share_pct"]; !ok {
+		return
+	}
+	var listed float64
+	for _, r := range b.Rows {
+		listed += r.Values["views"]
+	}
+	base := math.Max(total, listed)
+	for _, r := range b.Rows {
+		r.Values["view_share_pct"] = pct(r.Values["views"], base)
+	}
+	if listed < 0.95*total {
+		b.Note = fmt.Sprintf("Only %.0f%% of the period's %.0f views are attributed here; YouTube hides groups below its privacy threshold.", pct(listed, total), total)
+	}
 }
 
 func (s *Service) breakdown(ctx context.Context, p Period, videoID, name string, bs breakdownSpec) Breakdown {

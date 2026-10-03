@@ -1,6 +1,9 @@
 package analytics
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 // Kind says how a metric value should be displayed.
 type Kind string
@@ -16,6 +19,7 @@ const (
 
 // Label maps enum values from the Analytics API to readable names.
 func Label(dimension, value string) string {
+	key := Canonical(value)
 	var m map[string]string
 	switch dimension {
 	case "creatorContentType":
@@ -29,9 +33,9 @@ func Label(dimension, value string) string {
 	case "subscribedStatus":
 		m = subscribed
 	case "gender":
-		m = genders
+		m, key = genders, strings.ToLower(value)
 	}
-	if v, ok := m[value]; ok {
+	if v, ok := m[key]; ok {
 		return v
 	}
 	if strings.HasPrefix(value, "age") {
@@ -40,21 +44,41 @@ func Label(dimension, value string) string {
 	return value
 }
 
+// Canonical returns the documented UPPER_SNAKE_CASE form of an enum value.
+// The API returns some values in camelCase (creatorContentType: videoOnDemand).
+func Canonical(v string) string {
+	var b strings.Builder
+	prevLower := false
+	for _, r := range v {
+		if unicode.IsUpper(r) && prevLower {
+			b.WriteByte('_')
+		}
+		prevLower = unicode.IsLower(r) || unicode.IsDigit(r)
+		b.WriteRune(unicode.ToUpper(r))
+	}
+	return b.String()
+}
+
 var contentTypes = map[string]string{
 	"SHORTS": "Shorts", "VIDEO_ON_DEMAND": "Videos", "LIVE_STREAM": "Live", "STORY": "Stories", "UNSPECIFIED": "Unspecified",
 }
 
-// ContentTypeFilter maps a user-facing format name to creatorContentType.
+// contentTypeValues are the creatorContentType filter values the API
+// accepts. Filters must use this camelCase form; SHORTS is rejected.
+var contentTypeValues = []string{"videoOnDemand", "shorts", "liveStream"}
+
+// ContentTypeFilter maps a user-facing format name to a creatorContentType
+// filter value.
 func ContentTypeFilter(s string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "all":
 		return "", true
 	case "shorts", "short":
-		return "SHORTS", true
+		return "shorts", true
 	case "videos", "video", "long", "longform", "long-form":
-		return "VIDEO_ON_DEMAND", true
+		return "videoOnDemand", true
 	case "live", "livestream", "live_stream":
-		return "LIVE_STREAM", true
+		return "liveStream", true
 	}
 	return "", false
 }

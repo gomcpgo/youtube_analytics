@@ -122,12 +122,12 @@ type CommentList struct {
 
 // Comments lists recent or top comments on a video or the whole channel.
 // unanswered keeps only threads the channel has not replied to.
-func (s *Service) Comments(ctx context.Context, channelID, videoID, order string, limit int, unanswered bool) (*CommentList, error) {
+func (s *Service) Comments(ctx context.Context, apiKey, channelID, videoID, order string, limit int, unanswered bool) (*CommentList, error) {
 	fetch := limit
 	if unanswered {
 		fetch = min(limit*3, 300)
 	}
-	cs, err := s.yt.Comments(ctx, channelID, videoID, order, fetch)
+	cs, err := s.yt.Comments(ctx, apiKey, channelID, videoID, order, fetch)
 	if err != nil {
 		return nil, err
 	}

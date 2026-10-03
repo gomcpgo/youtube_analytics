@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -111,6 +112,12 @@ func (e *APIError) hint() string {
 	return ""
 }
 
+// IsServerError reports whether err is an HTTP 5xx from the API.
+func IsServerError(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.Status >= 500
+}
+
 // IsBadRequest reports whether err is an HTTP 400 from the API.
 func IsBadRequest(err error) bool {
 	var ae *APIError
@@ -155,6 +162,11 @@ func parseAPIError(status int, body []byte) error {
 }
 
 func (c *Client) do(ctx context.Context, method, u string, body interface{}) ([]byte, error) {
+	return c.doWith(ctx, c.http, method, u, body)
+}
+
+// doWith sends a request with the given HTTP client (OAuth or plain).
+func (c *Client) doWith(ctx context.Context, hc *http.Client, method, u string, body interface{}) ([]byte, error) {
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -171,7 +183,7 @@ func (c *Client) do(ctx context.Context, method, u string, body interface{}) ([]
 		req.Header.Set("Content-Type", "application/json")
 	}
 	start := time.Now()
-	resp, err := c.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		var re *ReauthError
 		if errors.As(err, &re) {
@@ -199,7 +211,10 @@ func (c *Client) getJSON(ctx context.Context, u string, out interface{}) error {
 	return json.Unmarshal(b, out)
 }
 
+var keyParam = regexp.MustCompile(`([?&]key=)[^&]+`)
+
 func redact(u string) string {
+	u = keyParam.ReplaceAllString(u, "${1}REDACTED")
 	if i := strings.Index(u, "?"); i > 0 && len(u) > 160 {
 		return u[:160] + "…"
 	}

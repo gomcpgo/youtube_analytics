@@ -58,7 +58,7 @@ func (h *Handler) afterConnect(ctx context.Context, a auth.Account) string {
 }
 
 func (h *Handler) connectChannel(ctx context.Context, a args) (*protocol.CallToolResponse, error) {
-	wait := time.Duration(a.intv("wait_seconds", 120, 0, 300)) * time.Second
+	wait := time.Duration(a.intv("wait_seconds", 90, 0, 300)) * time.Second
 	res, err := h.accounts.Connect(ctx, wait, a.boolv("open_browser", true))
 	if err != nil {
 		return nil, err
@@ -68,18 +68,20 @@ func (h *Handler) connectChannel(ctx context.Context, a args) (*protocol.CallToo
 		if !res.BrowserOpened {
 			opened = "Open this link in a browser:"
 		}
-		return textResponse(fmt.Sprintf(`Waiting for Google sign-in. %s
+		return textResponse(fmt.Sprintf(`Waiting for Google sign-in (not finished yet). %s
 
 %s
 
-The link stays valid for 10 minutes. If Google shows "Google hasn't verified this app", that is the user's own OAuth project: click Advanced, then "Go to (app name)". `+
-			`For a Google account with several channels, pick the channel to connect on the consent screen. After approving, call list_channels to confirm.`, opened, res.URL),
-			map[string]interface{}{"status": "pending", "url": res.URL, "browser_opened": res.BrowserOpened}), nil
+Tell the user:
+- The link stays valid for 10 minutes; calling connect_channel again reopens the same sign-in.
+- "Google hasn't verified this app" is expected for their own OAuth project: click Advanced, then "Go to (app name) (unsafe)".
+- "Access blocked: (app) has not completed the Google verification process" means the OAuth app is still in Testing: in Google Cloud Console open Google Auth Platform > Audience and click "Publish app" (or add their Google account under Test users).
+- For a Google account with several channels, pick the channel on the consent screen.
+After they approve, call list_channels to confirm.`, opened, res.URL)), nil
 	}
 	acct := res.Account
 	reachMsg := h.afterConnect(ctx, acct)
-	return textResponse(fmt.Sprintf("Connected %s (%s, channel ID %s). %s", acct.Title, acct.Handle, acct.ChannelID, reachMsg),
-		map[string]interface{}{"status": "connected", "channel_id": acct.ChannelID, "title": acct.Title, "handle": acct.Handle, "reach": reachMsg}), nil
+	return textResponse(fmt.Sprintf("Connected %s (%s, channel ID %s). %s", acct.Title, acct.Handle, acct.ChannelID, reachMsg)), nil
 }
 
 type channelStatus struct {
@@ -95,11 +97,15 @@ func (h *Handler) listChannels(ctx context.Context, a args) (*protocol.CallToolR
 	accts := h.accounts.Accounts()
 	var b strings.Builder
 	if !h.cfg.HasClient() {
-		b.WriteString("The Google OAuth client is not configured (YOUTUBE_OAUTH_CLIENT_ID / YOUTUBE_OAUTH_CLIENT_SECRET), so no channel can be queried. See the README.\n\n")
+		b.WriteString("The Google OAuth client is not configured (YOUTUBE_OAUTH_CLIENT_ID / YOUTUBE_OAUTH_CLIENT_SECRET), so no channel can be queried. See the README.\n")
+		if hint := h.cfg.SetupHint(); hint != "" {
+			b.WriteString(hint + "\n")
+		}
+		b.WriteString("\n")
 	}
 	if len(accts) == 0 {
 		b.WriteString("No channels connected yet. Call connect_channel to sign in with Google.\n")
-		return textResponse(b.String(), map[string]interface{}{"channels": []interface{}{}}), nil
+		return textResponse(b.String()), nil
 	}
 	statuses := make([]channelStatus, len(accts))
 	var fns []func()
@@ -138,7 +144,7 @@ func (h *Handler) listChannels(ctx context.Context, a args) (*protocol.CallToolR
 		rows = append(rows, []string{st.Title, st.Handle, st.ChannelID, subs, views, videos, reachLine(st.Reach), health})
 	}
 	b.WriteString(table([]string{"Channel", "Handle", "ID", "Subscribers", "Views", "Videos", "Impressions/CTR data", "Status"}, rows))
-	return textResponse(b.String(), map[string]interface{}{"channels": statuses}), nil
+	return textResponse(b.String()), nil
 }
 
 func reachLine(s *reach.Status) string {
@@ -171,6 +177,9 @@ func (h *Handler) channelOverview(ctx context.Context, a args) (*protocol.CallTo
 		fmt.Fprintf(&b, "Compared with %s to %s.\n", o.Previous.Start, o.Previous.End)
 	}
 	fmt.Fprintf(&b, "Lifetime: %s subscribers, %s views, %s videos.\n\n", count(float64(ch.Subscribers)), count(float64(ch.Views)), count(float64(ch.Videos)))
+	for _, n := range o.Notes {
+		b.WriteString(n + "\n\n")
+	}
 	b.WriteString(deltaTable(o.Metrics, o.Previous != nil))
 
 	if len(o.Formats) > 0 {
@@ -191,11 +200,24 @@ func (h *Handler) channelOverview(ctx context.Context, a args) (*protocol.CallTo
 	}
 	if len(o.Revenue) > 0 {
 		b.WriteString("\n## Revenue\n")
-		b.WriteString(deltaTable(o.Revenue, o.Previous != nil))
+		if allZero(o.Revenue) {
+			b.WriteString("All revenue metrics are zero: the channel is not monetized (YouTube Partner Program) or earned nothing in this period.\n")
+		} else {
+			b.WriteString(deltaTable(o.Revenue, o.Previous != nil))
+		}
 	}
 	b.WriteString("\n" + o.Reach.Note + "\n")
 	b.WriteString(errorsSection(o.Errors))
-	return textResponse(b.String(), o), nil
+	return textResponse(b.String()), nil
+}
+
+func allZero(ds []analytics.Delta) bool {
+	for _, d := range ds {
+		if d.Current != 0 || d.Previous != nil && *d.Previous != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func deltaTable(ds []analytics.Delta, compare bool) string {
@@ -238,7 +260,7 @@ func (h *Handler) listVideos(ctx context.Context, a args) (*protocol.CallToolRes
 			count(float64(v.Views)), count(float64(v.Likes)), count(float64(v.Comments)), v.Privacy})
 	}
 	b.WriteString(table([]string{"Published", "Title", "ID", "Length", "Views", "Likes", "Comments", "Privacy"}, rows))
-	return textResponse(b.String(), l), nil
+	return textResponse(b.String()), nil
 }
 
 func (h *Handler) comments(ctx context.Context, a args) (*protocol.CallToolResponse, error) {
@@ -254,7 +276,7 @@ func (h *Handler) comments(ctx context.Context, a args) (*protocol.CallToolRespo
 	if order != "relevance" {
 		order = "time"
 	}
-	l, err := svc.Comments(ctx, acct.ChannelID, vid, order, a.intv("limit", 30, 1, 100), a.boolv("unanswered_only", false))
+	l, err := svc.Comments(ctx, h.cfg.APIKey, acct.ChannelID, vid, order, a.intv("limit", 30, 1, 100), a.boolv("unanswered_only", false))
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +296,7 @@ func (h *Handler) comments(ctx context.Context, a args) (*protocol.CallToolRespo
 		}
 		fmt.Fprintf(&b, "- %s\n  %s\n", meta, truncate(c.Text, 500))
 	}
-	return textResponse(b.String(), l), nil
+	return textResponse(b.String()), nil
 }
 
 func (h *Handler) rawQuery(ctx context.Context, a args) (*protocol.CallToolResponse, error) {
@@ -313,7 +335,7 @@ func (h *Handler) rawQuery(ctx context.Context, a args) (*protocol.CallToolRespo
 		rows = append(rows, row)
 	}
 	text := fmt.Sprintf("%d rows.\n\n", len(rows)) + table(headers, rows)
-	return textResponse(text, map[string]interface{}{"columns": t.Columns, "rows": t.Records()}), nil
+	return textResponse(text), nil
 }
 
 func runAll(fns []func()) {

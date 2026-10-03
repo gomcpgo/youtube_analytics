@@ -81,7 +81,7 @@ func curve() []RetentionPoint {
 }
 
 func TestAnalyzeRetention(t *testing.T) {
-	r := AnalyzeRetention(curve(), 600)
+	r := AnalyzeRetention(curve(), 600, false)
 	if r.At30sPct == nil || math.Abs(*r.At30sPct-(90-0.3*5)) > 0.01 {
 		t.Errorf("At30s = %v, want 88.5", r.At30sPct)
 	}
@@ -107,7 +107,7 @@ func TestAnalyzeRetention(t *testing.T) {
 }
 
 func TestAnalyzeRetentionShortVideo(t *testing.T) {
-	r := AnalyzeRetention(curve(), 45)
+	r := AnalyzeRetention(curve(), 45, false)
 	if r.At30sPct != nil {
 		t.Errorf("videos under 90s should not report 0:30 retention")
 	}
@@ -121,5 +121,32 @@ func TestAdditive(t *testing.T) {
 		if Additive(m) != want {
 			t.Errorf("Additive(%s) = %v", m, !want)
 		}
+	}
+}
+
+func TestAnalyzeRetentionSmoothsNoise(t *testing.T) {
+	// A steady decline with ±2-point alternating noise and a 15-point cliff at 50%.
+	var pts []RetentionPoint
+	for i := 1; i <= 100; i++ {
+		r := float64(i) / 100
+		w := 0.8 - 0.3*r
+		if i%2 == 0 {
+			w += 0.04
+		}
+		if r > 0.50 {
+			w -= 0.15
+		}
+		pts = append(pts, RetentionPoint{Ratio: r, Watch: w, Relative: 0.5})
+	}
+	raw := AnalyzeRetention(append([]RetentionPoint(nil), pts...), 600, false)
+	if len(raw.Rewatches) == 0 {
+		t.Fatal("the raw noisy curve should produce spurious rewatch spikes")
+	}
+	sm := AnalyzeRetention(pts, 600, true)
+	if !sm.Smoothed || len(sm.Rewatches) != 0 {
+		t.Errorf("smoothed analysis should drop noise spikes, got %+v", sm.Rewatches)
+	}
+	if len(sm.Drops) == 0 || sm.Drops[0].FromSec > 300 || sm.Drops[0].ToSec < 306 {
+		t.Errorf("smoothed analysis should still find the cliff at 5:00, got %+v", sm.Drops)
 	}
 }

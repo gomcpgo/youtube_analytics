@@ -39,6 +39,10 @@ func (h *Handler) videoPerformance(ctx context.Context, a args) (*protocol.CallT
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d videos, %s, sorted by %s.\n\n", len(p.Videos), periodLine(p.Period), p.Sort)
+	if len(p.Videos) == 0 {
+		b.WriteString("No videos had views matching these filters in this period.\n")
+		return textResponse(b.String()), nil
+	}
 	var rows [][]string
 	for i, v := range p.Videos {
 		rows = append(rows, []string{fmt.Sprint(i + 1), truncate(v.Title, 55), v.ID, v.Published, v.Format, count(v.Views), hours(v.WatchMinutes),
@@ -47,7 +51,7 @@ func (h *Handler) videoPerformance(ctx context.Context, a args) (*protocol.CallT
 	}
 	b.WriteString(table([]string{"#", "Title", "ID", "Published", "Format", "Views", "Watch time", "Avg duration", "Avg % viewed", "Impressions", "CTR", "Subs gained", "Subs/1K views", "Engagement"}, rows))
 	b.WriteString("\n" + p.Reach.Note + "\n")
-	return textResponse(b.String(), p), nil
+	return textResponse(b.String()), nil
 }
 
 func (h *Handler) videoReport(ctx context.Context, a args) (*protocol.CallToolResponse, error) {
@@ -94,9 +98,12 @@ func (h *Handler) videoReport(ctx context.Context, a args) (*protocol.CallToolRe
 		}
 		b.WriteString(".\n")
 	}
-	if l := r.Launch; l != nil {
+	if l := r.Launch; l != nil && l.FromPublish {
 		fmt.Fprintf(&b, "\n## Launch curve\nFirst day %s views; first 7 days %s; peak %s on %s; last 7 days %s (%d days of data).\n",
 			count(l.FirstDayViews), count(l.First7DaysViews), count(l.PeakViews), l.PeakDate, count(l.Last7DaysViews), l.DaysWithData)
+	} else if l != nil {
+		fmt.Fprintf(&b, "\n## Daily views\nPeak %s on %s; last 7 days %s (%d days in the period). Use period lifetime for the launch curve.\n",
+			count(l.PeakViews), l.PeakDate, count(l.Last7DaysViews), l.DaysWithData)
 	}
 	if len(r.Traffic) > 0 {
 		b.WriteString("\n## Traffic sources\n")
@@ -105,6 +112,9 @@ func (h *Handler) videoReport(ctx context.Context, a args) (*protocol.CallToolRe
 	if r.Reach != nil && len(r.Reach.BySource) > 0 {
 		b.WriteString("\n## Impressions and CTR by source\n")
 		b.WriteString(reachSourceTable(r.Reach.BySource))
+	}
+	if len(r.SearchTerms) == 0 && searchViews(r.Traffic) > 0 {
+		fmt.Fprintf(&b, "\n## Top YouTube search terms\nYouTube withheld the individual terms behind the %s search views (each term had too few views to report).\n", count(searchViews(r.Traffic)))
 	}
 	if len(r.SearchTerms) > 0 {
 		b.WriteString("\n## Top YouTube search terms\n")
@@ -125,7 +135,7 @@ func (h *Handler) videoReport(ctx context.Context, a args) (*protocol.CallToolRe
 	}
 	b.WriteString("\n" + r.Coverage.Note + "\n")
 	b.WriteString(errorsSection(r.Errors))
-	return textResponse(b.String(), r), nil
+	return textResponse(b.String()), nil
 }
 
 func (h *Handler) videoRetention(ctx context.Context, a args) (*protocol.CallToolResponse, error) {
@@ -174,11 +184,23 @@ func (h *Handler) videoRetention(ctx context.Context, a args) (*protocol.CallToo
 	}
 	b.WriteString(table([]string{"Time", "Position", "Still watching", "Relative (0-1, 0.5 = typical)"}, rows))
 	b.WriteString("\n'Still watching' is audienceWatchRatio: values above 100% mean parts were rewatched. Relative retention compares with all YouTube videos of similar length.\n")
-	return textResponse(b.String(), r), nil
+	return textResponse(b.String()), nil
+}
+
+func searchViews(rows []analytics.SourceRow) float64 {
+	for _, r := range rows {
+		if r.Source == "YT_SEARCH" {
+			return r.Views
+		}
+	}
+	return 0
 }
 
 func retentionSummary(r *analytics.Retention) string {
 	var b strings.Builder
+	if r.Smoothed {
+		fmt.Fprintf(&b, "- Few views (%s lifetime): the curve is noisy, so drops and spikes below use a 5-point moving average. Treat them as directional.\n", count(float64(r.Views)))
+	}
 	fmt.Fprintf(&b, "- Average percentage viewed ≈ %s; relative retention avg %.2f (0.5 = typical for this length)\n", percent(r.AvgWatchPct), r.RelativeAvg)
 	checkpoints := fmt.Sprintf("- Retention: start %s", percent(r.StartPct))
 	if r.At30sPct != nil {
@@ -188,10 +210,10 @@ func retentionSummary(r *analytics.Retention) string {
 	b.WriteString(checkpoints)
 	fmt.Fprintf(&b, "- Intro (0:00 to %s): %+.1f points\n", clock(r.Intro.ToSec), r.Intro.PointsPP)
 	if len(r.Drops) > 0 {
-		b.WriteString("- Steepest drop-offs after the intro: " + spanList(r.Drops, true) + "\n")
+		b.WriteString("- Sharpest drop-offs after the intro (in time order): " + spanList(r.Drops, true) + "\n")
 	}
 	if len(r.Rewatches) > 0 {
-		b.WriteString("- Rewatch spikes (viewers seeking back or replaying): " + spanList(r.Rewatches, true) + "\n")
+		b.WriteString("- Rewatch spikes, where viewers seek back or replay (in time order): " + spanList(r.Rewatches, true) + "\n")
 	}
 	if len(r.Exits) > 0 {
 		var parts []string
@@ -200,7 +222,17 @@ func retentionSummary(r *analytics.Retention) string {
 		}
 		b.WriteString("- Most common exit points: " + strings.Join(parts, ", ") + "\n")
 	}
-	fmt.Fprintf(&b, "- Outro (last 5%%): %.1f points lost\n", r.OutroLossPP)
+	if !r.ExitData {
+		b.WriteString("- Exit points: YouTube withholds exit counts for this video (too few views).\n")
+	}
+	switch {
+	case r.OutroLossPP >= 0.05:
+		fmt.Fprintf(&b, "- Outro (last 5%%): %.1f points lost\n", r.OutroLossPP)
+	case r.OutroLossPP <= -0.05:
+		fmt.Fprintf(&b, "- Outro (last 5%%): retention rose %.1f points\n", -r.OutroLossPP)
+	default:
+		b.WriteString("- Outro (last 5%): no loss\n")
+	}
 	return b.String()
 }
 

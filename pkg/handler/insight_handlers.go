@@ -30,6 +30,10 @@ func (h *Handler) trafficSources(ctx context.Context, a args) (*protocol.CallToo
 		}
 		var b strings.Builder
 		fmt.Fprintf(&b, "Top %s for the %s, %s.\n\n", d.SourceLabel, scope, periodLine(d.Period))
+		if len(d.Rows) == 0 {
+			b.WriteString("YouTube returned no detail rows: entries with very few views are withheld for privacy.\n")
+			return textResponse(b.String()), nil
+		}
 		var rows [][]string
 		for _, r := range d.Rows {
 			detail := r.Detail
@@ -39,7 +43,7 @@ func (h *Handler) trafficSources(ctx context.Context, a args) (*protocol.CallToo
 			rows = append(rows, []string{detail, count(r.Views), hours(r.WatchMinutes)})
 		}
 		b.WriteString(table([]string{"Detail", "Views", "Watch time"}, rows))
-		return textResponse(b.String(), d), nil
+		return textResponse(b.String()), nil
 	}
 	t, err := svc.TrafficSources(ctx, a.period(), vid, a.boolv("compare", true))
 	if err != nil {
@@ -53,7 +57,7 @@ func (h *Handler) trafficSources(ctx context.Context, a args) (*protocol.CallToo
 		b.WriteString(reachSourceTable(t.Reach))
 	}
 	b.WriteString("\n" + t.Coverage.Note + "\nUse detail_for (e.g. YT_SEARCH, RELATED_VIDEO, EXT_URL) to drill into a source.\n")
-	return textResponse(b.String(), t), nil
+	return textResponse(b.String()), nil
 }
 
 func (h *Handler) audience(ctx context.Context, a args) (*protocol.CallToolResponse, error) {
@@ -86,8 +90,11 @@ func (h *Handler) audience(ctx context.Context, a args) (*protocol.CallToolRespo
 			continue
 		}
 		b.WriteString(breakdownTable(bd))
+		if bd.Note != "" {
+			b.WriteString(bd.Note + "\n")
+		}
 	}
-	return textResponse(b.String(), au), nil
+	return textResponse(b.String()), nil
 }
 
 func (h *Handler) timeline(ctx context.Context, a args) (*protocol.CallToolResponse, error) {
@@ -123,7 +130,7 @@ func (h *Handler) timeline(ctx context.Context, a args) (*protocol.CallToolRespo
 
 	rows, note := t.Rows, ""
 	if len(rows) > 120 {
-		rows, note = weekly(t), "Shown as weekly totals (averages for non-additive metrics); the daily rows are in structured content.\n"
+		rows, note = weekly(t), "Shown as weekly totals (averages for non-additive metrics); ask for a shorter period to see single days.\n"
 	}
 	b.WriteString("\n" + note)
 	headers := []string{"Date"}
@@ -146,7 +153,7 @@ func (h *Handler) timeline(ctx context.Context, a args) (*protocol.CallToolRespo
 	if t.Reach != nil && !t.Reach.Available {
 		b.WriteString("\n" + t.Reach.Note + "\n")
 	}
-	return textResponse(b.String(), t), nil
+	return textResponse(b.String()), nil
 }
 
 // weekly folds daily rows into 7-day buckets for display.
@@ -201,7 +208,7 @@ func (h *Handler) impressions(ctx context.Context, a args) (*protocol.CallToolRe
 		fmt.Fprintf(&b, "Downloaded %d new report files.\n", r.Downloaded)
 	}
 	if !r.Coverage.Available {
-		return textResponse(b.String(), r), nil
+		return textResponse(b.String()), nil
 	}
 	fmt.Fprintf(&b, "\nTotal: %s impressions, CTR %s (about %s clicks).\n\n", count(math.Round(r.Impressions)), percent(r.CTR), count(math.Round(r.Impressions*r.CTR/100)))
 	var rows [][]string
@@ -222,7 +229,7 @@ func (h *Handler) impressions(ctx context.Context, a args) (*protocol.CallToolRe
 		headers = append(headers, "ID")
 	}
 	b.WriteString(table(append(headers, "Impressions", "Share", "CTR", "Clicks"), rows))
-	return textResponse(b.String(), r), nil
+	return textResponse(b.String()), nil
 }
 
 func groupHeader(g string) string {

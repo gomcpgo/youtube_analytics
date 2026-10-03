@@ -30,6 +30,10 @@ const (
 	Combined = "channel_reach_combined_a1" // + traffic source, device, OS
 )
 
+// newJobGrace is how long a freshly created job may fail to list reports
+// before that counts as an error.
+const newJobGrace = 72 * time.Hour
+
 // ReportTypes are the jobs this server schedules for every connected channel.
 var ReportTypes = []string{Basic, Combined}
 
@@ -174,6 +178,7 @@ func (c *Cache) Sync(ctx context.Context, api API, maxAge time.Duration) (SyncRe
 	if err != nil && len(c.idx.Jobs) == 0 {
 		return res, err
 	}
+	var failures []string
 	for _, rt := range ReportTypes {
 		job, ok := c.idx.Jobs[rt]
 		if !ok {
@@ -181,7 +186,12 @@ func (c *Cache) Sync(ctx context.Context, api API, maxAge time.Duration) (SyncRe
 		}
 		reports, err := api.Reports(ctx, job.ID)
 		if err != nil {
-			return res, fmt.Errorf("list %s reports: %w", rt, err)
+			// A job answers 503 until YouTube has generated its first report.
+			if youtube.IsServerError(err) && c.now().Sub(job.CreateTime) < newJobGrace {
+				continue
+			}
+			failures = append(failures, fmt.Sprintf("list %s reports: %v", rt, err))
+			continue
 		}
 		// Backfills reuse a day with a newer createTime; keep the newest.
 		best := map[string]youtube.Report{}
@@ -200,15 +210,24 @@ func (c *Cache) Sync(ctx context.Context, api API, maxAge time.Duration) (SyncRe
 				continue
 			}
 			body, err := api.Download(ctx, r.DownloadURL)
-			if err != nil {
-				return res, fmt.Errorf("download %s %s: %w", rt, d, err)
+			if err == nil {
+				err = c.writeDay(rt, d, body)
 			}
-			if err := c.writeDay(rt, d, body); err != nil {
-				return res, err
+			if err != nil {
+				failures = append(failures, fmt.Sprintf("download %s %s: %v", rt, d, err))
+				continue
 			}
 			c.idx.Days[rt][d] = DayFile{ReportID: r.ID, CreateTime: r.CreateTime}
 			res.Downloaded++
 		}
+	}
+	// Keep what was downloaded; leave LastSync alone on failure so the next
+	// call retries instead of waiting an hour.
+	if len(failures) > 0 {
+		if err := c.saveLocked(); err != nil {
+			return res, err
+		}
+		return res, errors.New(strings.Join(failures, "; "))
 	}
 	c.idx.LastSync = c.now().UTC()
 	return res, c.saveLocked()

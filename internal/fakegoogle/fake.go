@@ -1,7 +1,14 @@
 // Package fakegoogle is an in-process stand-in for the YouTube Data,
-// Analytics and Reporting APIs, used by tests. It enforces the documented
-// query constraints this server relies on (sort/maxResults limits, month
-// dates, single-video retention) so wiring mistakes fail loudly.
+// Analytics and Reporting APIs, used by tests. It enforces the query
+// constraints this server relies on (sort/maxResults limits, month dates,
+// single-video retention) and mimics behavior observed on the real API that
+// contradicts the docs:
+//   - creatorContentType values are camelCase (videoOnDemand, shorts,
+//     liveStream); filters with the documented SHORTS form are rejected;
+//   - video and creatorContentType cannot be combined as dimensions;
+//   - retention exit metrics (startedWatching/stoppedWatching) are withheld
+//     for small videos, and asking for them with the curve empties the curve;
+//   - comments cannot be read with the read-only OAuth scope (API key only).
 package fakegoogle
 
 import (
@@ -37,13 +44,20 @@ type Server struct {
 	Reject func(url.Values) bool
 	// Days are the dates (YYYY-MM-DD) reach reports exist for.
 	Days []string
+	// ExitData makes retention exit metrics available (big videos).
+	ExitData bool
+	// ChannelCreated is the channel's publishedAt (RFC 3339).
+	ChannelCreated string
 }
+
+// formats is each fake video's creatorContentType as the API returns it.
+var formats = map[string]string{Vid1: "videoOnDemand", Vid2: "shorts", Vid3: "liveStream"}
 
 // New starts a fake with reach reports for the 5th and 4th days before today.
 func New() *Server {
 	pt, _ := time.LoadLocation("America/Los_Angeles")
 	today := time.Now().In(pt)
-	s := &Server{Jobs: map[string]string{}}
+	s := &Server{Jobs: map[string]string{}, ChannelCreated: "2020-01-15T10:00:00Z"}
 	for _, back := range []int{5, 4} {
 		s.Days = append(s.Days, today.AddDate(0, 0, -back).Format("2006-01-02"))
 	}
@@ -73,7 +87,7 @@ func apiError(w http.ResponseWriter, code int, msg string) {
 func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"items": []interface{}{map[string]interface{}{
 		"id":             ChannelID,
-		"snippet":        map[string]interface{}{"title": "Fake Channel", "customUrl": "@fakechannel", "publishedAt": "2020-01-15T10:00:00Z"},
+		"snippet":        map[string]interface{}{"title": "Fake Channel", "customUrl": "@fakechannel", "publishedAt": s.ChannelCreated},
 		"statistics":     map[string]interface{}{"viewCount": "123456", "subscriberCount": "4321", "videoCount": "3"},
 		"contentDetails": map[string]interface{}{"relatedPlaylists": map[string]string{"uploads": "UUfake"}},
 	}}})
@@ -112,6 +126,11 @@ func (s *Server) videos(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) comments(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("key") == "" {
+		w.WriteHeader(403)
+		writeJSON(w, map[string]interface{}{"error": map[string]interface{}{"code": 403, "message": "Request had insufficient authentication scopes.", "errors": []map[string]string{{"reason": "insufficientPermissions"}}}})
+		return
+	}
 	thread := func(id, text, author, authorID string, ownerReply bool) map[string]interface{} {
 		sn := map[string]interface{}{"authorDisplayName": author, "authorChannelId": map[string]string{"value": authorID}, "textDisplay": text, "likeCount": 3, "publishedAt": "2026-09-01T10:00:00Z"}
 		t := map[string]interface{}{"id": id, "snippet": map[string]interface{}{"videoId": Vid1, "totalReplyCount": 0, "topLevelComment": map[string]interface{}{"snippet": sn}}}
@@ -133,7 +152,7 @@ func (s *Server) analytics(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	s.mu.Lock()
 	s.Queries = append(s.Queries, q)
-	reject := s.Reject
+	reject, exitData := s.Reject, s.ExitData
 	s.mu.Unlock()
 	if reject != nil && reject(q) {
 		apiError(w, 400, "The query is not supported.")
@@ -146,6 +165,17 @@ func (s *Server) analytics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	keys := dimensionValues(dims, q)
+	filters := parseFilters(q.Get("filters"))
+	if ct, ok := filters["creatorContentType"]; ok {
+		if ct != "videoOnDemand" && ct != "shorts" && ct != "liveStream" && ct != "story" {
+			apiError(w, 400, "Invalid value ("+ct+") given in field parameters.filters.")
+			return
+		}
+	}
+	keys = filterRows(dims, keys, filters)
+	if exitMetrics(metrics) && (!exitData || len(metrics) > 2) {
+		keys = nil // withheld; mixing them with the curve empties the curve too
+	}
 	var headers []map[string]string
 	for _, d := range dims {
 		headers = append(headers, map[string]string{"name": d, "columnType": "DIMENSION", "dataType": "STRING"})
@@ -160,11 +190,53 @@ func (s *Server) analytics(w http.ResponseWriter, r *http.Request) {
 			row = append(row, v)
 		}
 		for _, m := range metrics {
-			row = append(row, metricValue(m, i, len(keys)))
+			v := metricValue(m, i, len(keys))
+			if len(dims) == 1 && dims[0] == "country" && m == "views" {
+				v /= 10 // most views fall below the privacy threshold
+			}
+			row = append(row, v)
 		}
 		rows = append(rows, row)
 	}
 	writeJSON(w, map[string]interface{}{"kind": "youtubeAnalytics#resultTable", "columnHeaders": headers, "rows": rows})
+}
+
+func parseFilters(s string) map[string]string {
+	out := map[string]string{}
+	for _, f := range split(s, ";") {
+		if k, v, ok := strings.Cut(f, "=="); ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// filterRows applies video and creatorContentType filters to video rows.
+func filterRows(dims []string, keys [][]interface{}, filters map[string]string) [][]interface{} {
+	if len(dims) == 0 || dims[0] != "video" {
+		return keys
+	}
+	var out [][]interface{}
+	for _, k := range keys {
+		id := k[0].(string)
+		if list, ok := filters["video"]; ok && !strings.Contains(","+list+",", ","+id+",") {
+			continue
+		}
+		if ct, ok := filters["creatorContentType"]; ok && formats[id] != ct {
+			continue
+		}
+		out = append(out, k)
+	}
+	return out
+}
+
+func exitMetrics(metrics []string) bool {
+	for _, m := range metrics {
+		if m == "startedWatching" || m == "stoppedWatching" {
+			return true
+		}
+	}
+	return false
 }
 
 func validate(q url.Values, dims []string) string {
@@ -179,6 +251,8 @@ func validate(q url.Values, dims []string) string {
 	max := 0
 	fmt.Sscanf(q.Get("maxResults"), "%d", &max)
 	switch {
+	case has("video") && has("creatorContentType"):
+		return "The query is not supported."
 	case q.Get("ids") != "channel==MINE":
 		return "ids must be channel==MINE"
 	case q.Get("startDate") == "" || q.Get("endDate") == "" || q.Get("metrics") == "":
@@ -209,9 +283,7 @@ func dimensionValues(dims []string, q url.Values) [][]interface{} {
 	case "":
 		return [][]interface{}{{}}
 	case "creatorContentType":
-		return one("VIDEO_ON_DEMAND", "SHORTS")
-	case "video,creatorContentType":
-		return [][]interface{}{{Vid1, "VIDEO_ON_DEMAND"}, {Vid2, "SHORTS"}, {Vid3, "LIVE_STREAM"}}
+		return one("videoOnDemand", "shorts")
 	case "video":
 		return one(Vid1, Vid2, Vid3)
 	case "day":

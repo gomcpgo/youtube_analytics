@@ -139,7 +139,7 @@ func (m *Manager) Connect(ctx context.Context, wait time.Duration, openBrowser b
 	m.mu.Unlock()
 
 	res := &ConnectResult{URL: p.url}
-	if fresh && openBrowser {
+	if openBrowser {
 		res.BrowserOpened = OpenBrowser(p.url)
 	}
 	timer := time.NewTimer(wait)

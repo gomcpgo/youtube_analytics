@@ -75,7 +75,11 @@ func (s *Service) Timeline(ctx context.Context, spec PeriodSpec, videoID, granul
 	var qErr error
 	var rows []reach.Row
 	var cov Coverage
-	fns := []func(){func() { t, qErr = s.yt.Query(ctx, q) }}
+	var created time.Time
+	fns := []func(){
+		func() { t, qErr = s.yt.Query(ctx, q) },
+		func() { created = s.createdAt(ctx, videoID) },
+	}
 	if granularity == "day" {
 		fns = append(fns, func() { rows, cov = s.reachRows(ctx, reach.Basic, cur) })
 	}
@@ -96,7 +100,22 @@ func (s *Service) Timeline(ctx context.Context, spec PeriodSpec, videoID, granul
 	if granularity == "day" {
 		out.Reach = &cov
 	}
+	// Drop the empty stretch before the channel or video existed.
+	from := ""
+	if !created.IsZero() {
+		day := created.In(youtube.Pacific).Format(dateLayout)
+		if day > out.Period.Start && day <= out.Period.End {
+			out.Period.Start = day
+		}
+		from = day
+		if granularity == "month" {
+			from = day[:7]
+		}
+	}
 	for _, r := range t.Rows {
+		if t.Str(r, granularity) < from {
+			continue
+		}
 		row := TimelineRow{Date: t.Str(r, granularity), Values: map[string]float64{}}
 		for _, m := range metrics {
 			row.Values[m] = t.Num(r, m)
@@ -110,6 +129,21 @@ func (s *Service) Timeline(ctx context.Context, spec PeriodSpec, videoID, granul
 		out.Summary = append(out.Summary, summarize(out.Rows, m))
 	}
 	return out, nil
+}
+
+// createdAt is the publish time of the video, or the channel's creation
+// time; zero when it cannot be read.
+func (s *Service) createdAt(ctx context.Context, videoID string) time.Time {
+	if videoID != "" {
+		if v, err := s.yt.Video(ctx, videoID); err == nil {
+			return v.PublishedAt
+		}
+		return time.Time{}
+	}
+	if ch, err := s.yt.MyChannel(ctx); err == nil {
+		return ch.PublishedAt
+	}
+	return time.Time{}
 }
 
 func summarize(rows []TimelineRow, m string) SeriesSummary {

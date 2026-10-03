@@ -117,22 +117,30 @@ func (s *Service) resolveWithPrev(ctx context.Context, spec PeriodSpec) (Period,
 // videoStats queries per-video metrics and joins titles and formats.
 func (s *Service) videoStats(ctx context.Context, p Period, opt PerformanceOptions) ([]VideoStat, error) {
 	sortExpr, max := apiSorts[opt.Sort], opt.Limit
-	if sortExpr == "" || opt.ContentType != "" || max <= 0 || max > 200 {
+	if sortExpr == "" || max <= 0 || max > 200 {
 		if sortExpr == "" {
 			sortExpr = "-views"
 		}
 		max = 200
 	}
-	q := youtube.Query{Start: p.Start, End: p.End, Metrics: videoMetrics, Dimensions: []string{"video", "creatorContentType"}, Sort: sortExpr, MaxResults: max}
+	var filters []string
 	if len(opt.VideoIDs) > 0 {
-		q.Filters = []string{"video==" + strings.Join(opt.VideoIDs, ",")}
-		q.MaxResults = 200
+		filters = append(filters, "video=="+strings.Join(opt.VideoIDs, ","))
+		max = 200
 	}
-	t, err := s.query(ctx, q, "engagedViews")
-	if err != nil && youtube.IsBadRequest(err) {
-		q.Dimensions = []string{"video"}
-		t, err = s.query(ctx, q, "engagedViews")
+	if opt.ContentType != "" {
+		filters = append(filters, "creatorContentType=="+opt.ContentType)
 	}
+	q := youtube.Query{Start: p.Start, End: p.End, Metrics: videoMetrics, Dimensions: []string{"video"}, Filters: filters, Sort: sortExpr, MaxResults: max}
+	var t *youtube.Table
+	var err error
+	formats := map[string]string{}
+	fns := []func(){func() { t, err = s.query(ctx, q, "engagedViews") }}
+	if opt.ContentType == "" {
+		fns = append(fns, func() { formats = s.videoFormats(ctx, p, opt.VideoIDs) })
+	}
+	parallel(fns...)
+
 	var stats []VideoStat
 	switch {
 	case err != nil && len(opt.VideoIDs) > 0 && youtube.IsBadRequest(err):
@@ -142,51 +150,55 @@ func (s *Service) videoStats(ctx context.Context, p Period, opt PerformanceOptio
 	case err != nil:
 		return nil, err
 	default:
-		stats = mergeVideoRows(t)
-	}
-	if opt.ContentType != "" {
-		want := Label("creatorContentType", opt.ContentType)
-		kept := stats[:0]
-		for _, v := range stats {
-			if v.Format == want {
-				kept = append(kept, v)
-			}
+		for _, r := range t.Rows {
+			stats = append(stats, VideoStat{
+				ID: t.Str(r, "video"), Views: t.Num(r, "views"), EngagedViews: t.Num(r, "engagedViews"), WatchMinutes: t.Num(r, "estimatedMinutesWatched"),
+				AvgViewDurationSec: t.Num(r, "averageViewDuration"), AvgViewPct: t.Num(r, "averageViewPercentage"),
+				SubsGained: t.Num(r, "subscribersGained"), Likes: t.Num(r, "likes"), Comments: t.Num(r, "comments"), Shares: t.Num(r, "shares"),
+			})
 		}
-		stats = kept
+	}
+	for i := range stats {
+		if opt.ContentType != "" {
+			stats[i].Format = Label("creatorContentType", opt.ContentType)
+		} else {
+			stats[i].Format = formats[stats[i].ID]
+		}
 	}
 	return stats, s.enrich(ctx, stats)
 }
 
-// mergeVideoRows folds rows (one per video and format) into VideoStats.
-func mergeVideoRows(t *youtube.Table) []VideoStat {
-	idx := map[string]int{}
-	var out []VideoStat
-	for _, r := range t.Rows {
-		id := t.Str(r, "video")
-		v := VideoStat{
-			ID: id, Format: Label("creatorContentType", t.Str(r, "creatorContentType")),
-			Views: t.Num(r, "views"), EngagedViews: t.Num(r, "engagedViews"), WatchMinutes: t.Num(r, "estimatedMinutesWatched"),
-			AvgViewDurationSec: t.Num(r, "averageViewDuration"), AvgViewPct: t.Num(r, "averageViewPercentage"),
-			SubsGained: t.Num(r, "subscribersGained"), Likes: t.Num(r, "likes"), Comments: t.Num(r, "comments"), Shares: t.Num(r, "shares"),
-		}
-		i, seen := idx[id]
-		if !seen {
-			idx[id] = len(out)
-			out = append(out, v)
-			continue
-		}
-		o := &out[i]
-		total := o.Views + v.Views
-		if total > 0 {
-			o.AvgViewDurationSec = (o.AvgViewDurationSec*o.Views + v.AvgViewDurationSec*v.Views) / total
-			o.AvgViewPct = (o.AvgViewPct*o.Views + v.AvgViewPct*v.Views) / total
-		}
-		if v.Views > o.Views/2 && v.Format != o.Format {
-			o.Format += "/" + v.Format
-		}
-		o.Views, o.EngagedViews, o.WatchMinutes = total, o.EngagedViews+v.EngagedViews, o.WatchMinutes+v.WatchMinutes
-		o.SubsGained, o.Likes, o.Comments, o.Shares = o.SubsGained+v.SubsGained, o.Likes+v.Likes, o.Comments+v.Comments, o.Shares+v.Shares
+// videoFormats tags videos with their format. The API rejects video and
+// creatorContentType together as dimensions, so this runs one query per
+// format with a creatorContentType filter. Failures leave videos untagged.
+func (s *Service) videoFormats(ctx context.Context, p Period, ids []string) map[string]string {
+	out := map[string]string{}
+	var mu sync.Mutex
+	var fns []func()
+	for _, ct := range contentTypeValues {
+		ct := ct
+		fns = append(fns, func() {
+			filters := []string{"creatorContentType==" + ct}
+			if len(ids) > 0 {
+				filters = append(filters, "video=="+strings.Join(ids, ","))
+			}
+			t, err := s.yt.Query(ctx, youtube.Query{Start: p.Start, End: p.End, Metrics: []string{"views"}, Dimensions: []string{"video"},
+				Filters: filters, Sort: "-views", MaxResults: 200})
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, r := range t.Rows {
+				id, label := t.Str(r, "video"), Label("creatorContentType", ct)
+				if cur, ok := out[id]; ok && cur != label {
+					label = cur + "/" + label
+				}
+				out[id] = label
+			}
+		})
 	}
+	parallel(fns...)
 	return out
 }
 

@@ -16,6 +16,9 @@ type Launch struct {
 	PeakDate        string  `json:"peak_date"`
 	PeakViews       float64 `json:"peak_views"`
 	DaysWithData    int     `json:"days_with_data"`
+	// FromPublish is true when the series starts on the publish date, so
+	// the first day and first 7 days describe the launch.
+	FromPublish bool `json:"from_publish"`
 }
 
 // Benchmark is the channel's typical performance for comparison.
@@ -90,6 +93,9 @@ func (s *Service) VideoReport(ctx context.Context, videoID string, spec PeriodSp
 					"views": t.Num(row, "views"), "estimatedMinutesWatched": t.Num(row, "estimatedMinutesWatched"), "subscribersGained": t.Num(row, "subscribersGained")}})
 			}
 			r.Launch = launch(r.Daily)
+			if r.Launch != nil {
+				r.Launch.FromPublish = p.Start == v.PublishedAt.In(youtube.Pacific).Format(dateLayout)
+			}
 		},
 		func() {
 			t, err := s.yt.Query(ctx, youtube.Query{Start: p.Start, End: p.End, Metrics: []string{"views", "estimatedMinutesWatched"},
